@@ -1,32 +1,25 @@
 import requests
-import pandas as pd
 import os
 
-def get_limit_up_stocks():
-    # 抓取證交所每日收盤資料
+def get_raw_data():
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALL"
     try:
-        data = requests.get(url, timeout=10).json()
-        # 尋找包含「漲停」資訊的資料結構
-        # 證交所 API 資料通常在 data9 或 data8，直接遍歷尋找
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        # 直接抓取所有鍵值的第一個元素，看看裡面長怎樣
         for key in data:
             if isinstance(data[key], list) and len(data[key]) > 0:
-                # 篩選含有「漲停」字樣的行
-                for row in data[key]:
-                    if "漲停" in str(row):
-                        return row
-        return None
-    except:
-        return None
+                return f"Key: {key}, 第一筆資料: {str(data[key][0])[:100]}"
+        return "找不到任何資料列"
+    except Exception as e:
+        return f"連線錯誤: {str(e)}"
 
-def send_telegram(stock_info):
+def send_telegram(msg):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    msg = f"🚀 發現漲停股: {stock_info}" if stock_info else "今日無漲停資訊。"
     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                  data={"chat_id": chat_id, "text": msg})
+                  data={"chat_id": chat_id, "text": f"DEBUG: {msg}"})
 
 if __name__ == "__main__":
-    info = get_limit_up_stocks()
-    send_telegram(info)
-
+    msg = get_raw_data()
+    send_telegram(msg)
