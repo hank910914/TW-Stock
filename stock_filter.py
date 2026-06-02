@@ -9,7 +9,6 @@ def get_strong_stocks():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # 強制用台灣時間(UTC+8)來推算日期
     current_tw_time = datetime.utcnow() + timedelta(hours=8)
     
     for i in range(10):
@@ -31,24 +30,17 @@ def get_strong_stocks():
             
             df = pd.DataFrame(rows, columns=columns)
             
-            # 1. 確保關鍵欄位文字清理乾淨，並轉成數字
             for col in ['收盤價', '最高價', '最低價', '開盤價', '成交金額']:
                 df[col] = df[col].astype(str).str.replace(',', '')
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # 2. 終極安全篩選邏輯：
-            # 成交金額 >= 8000 萬 
-            # 且 收盤價等於最高價 (鎖死)
-            # 且 收盤價大於開盤價 (確保是紅 K)
-            # 且 當天收盤比最低價漲幅超過 9% (抓出實質拉上漲停的股票)
+            # 【測試專用放寬條件】：成交額大於 1000 萬 且 收盤價 > 開盤價 (只要是紅K就抓)
+            # 另外限制只抓前 10 檔，避免 Telegram 訊息太長爆炸
             df_filtered = df[
-                (df['成交金額'] >= 80000000) & 
-                (df['收盤價'] == df['最高價']) &
-                (df['收盤價'] > df['開盤價']) &
-                ((df['收盤價'] / df['最低價']) >= 1.09)
-            ].copy()
+                (df['成交金額'] >= 10000000) & 
+                (df['收盤價'] > df['開盤價'])
+            ].head(10).copy()
             
-            # 3. 恢復原本要輸出的欄位名稱
             show_cols = ['證券代號', '證券名稱', '開盤價', '最高價', '最低價', '收盤價', '漲跌價差', '成交金額']
             df_out = df_filtered[show_cols]
             df_out.columns = ['股票代號', '股票名稱', '開盤價', '最高價', '最低價', '收盤價', '漲跌價差', '成交金額(元)']
@@ -75,7 +67,7 @@ def send_telegram_notification(df, trade_date):
     if df is None or df.empty:
         message = f"📊 *【台股強勢股監控】*\n📅 交易日期：`{formatted_date}`\n\n本日未篩選出符合「成交值破億 + 鎖漲停」的個股。"
     else:
-        message = f"📊 *【台股強勢股監控】*\n📅 交易日期：`{formatted_date}`\n\n🔥 *今日符合條件個股如下：*\n"
+        message = f"📊 *【台股強勢股監控】*\n📅 交易日期：`{formatted_date}`\n\n🔥 *今日【紅K棒】測試清單如下：*\n"
         for idx, row in df.iterrows():
             amount_in_yi = row['成交金額(元)'] / 100000000
             message += f"────────────────\n"
