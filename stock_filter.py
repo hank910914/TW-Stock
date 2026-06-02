@@ -5,12 +5,11 @@ import os
 import time
 
 def get_strong_stocks():
-    # 建立一個最多往前嘗試 10 天的迴圈，確保一定能抓到最新一個交易日的資料
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # 考量到 GitHub 伺服器是國際標準時(UTC)，我們直接強制用台灣時間(UTC+8)來推算日期
+    # 強制用台灣時間(UTC+8)來推算日期
     current_tw_time = datetime.utcnow() + timedelta(hours=8)
     
     for i in range(10):
@@ -22,9 +21,8 @@ def get_strong_stocks():
             response = requests.get(url, headers=headers)
             data = response.json()
             
-            # 如果這天沒開盤或沒資料，就跳過，嘗試前一天
             if data.get('stat') != 'OK':
-                time.sleep(2) # 避免對證交所請求太快
+                time.sleep(2)
                 continue
                 
             print(f"🎉 成功取得 {target_date} 的交易資料！開始篩選...")
@@ -33,18 +31,41 @@ def get_strong_stocks():
             
             df = pd.DataFrame(rows, columns=columns)
             
-            # 清理資料格式
-            df['成交金額'] = df['成交金額'].str.replace(',', '').astype(float)
-            df['漲跌價差'] = df['漲跌價差'].str.replace(',', '')
-            df['收盤價'] = df['收盤價'].str.replace(',', '')
+            # 1. 清理乾淨所有千分位逗號
+            for col in ['收盤價', '最高價', '最低價', '開盤價', '漲跌價差', '成交金額']:
+                df[col] = df[col].astype(str).str.replace(',', '')
             
-            # 篩選條件：成交金額大於 1 億，且最後一欄自訂標記含漲停
+            # 2. 轉成數字型態（若有強迫暫停交易的文字會變成 NaN）
+            df['成交金額'] = pd.to_numeric(df['成交金額'], errors='coerce')
+            df['收盤價'] = pd.to_numeric(df['收盤價'], errors='coerce')
+            df['最高價'] = pd.to_numeric(df['最高價'], errors='coerce')
+            
+            # 3. 處理證交所獨特的「漲跌符號」與「價差數字」
+            # 證交所的漲跌符號藏在 '漲跌/+/-' 欄位，或者直接附在價差文字前
+            # 為了防呆，我們直接用安全的方式去解析價差正負
+            def clean_sign(row):
+                sign_text = str(row.get('漲跌', '')) or str(row.get('漲跌/+/-', ''))
+                diff_val = pd.to_numeric(row['漲跌價差'], errors='coerce')
+                if pd.isna(diff_val):
+                    return 0.0
+                if '-' in sign_text or '𠁎' in sign_text: # 包含跌的符號
+                    return -diff_val
+                return diff_val
+                
+            df['實際價差'] = df.apply(clean_sign, axis=1)
+            
+            # 4. 透過數學精準反推「昨收價」並計算「當日漲幅」
+            df['昨收'] = df['收盤價'] - df['實際價差']
+            df['漲幅'] = (df['實際價差'] / df['昨收']) * 100
+            
+            # 5. 終極嚴格篩選：成交額大於 8000 萬 + 漲幅達 9.5% 以上 + 收盤價鎖在最高點
             df_filtered = df[
-                (df['成交金額'] >= 100000000) & 
-                (df[df.columns[-1]].str.contains('漲停', na=False))
+                (df['成交金額'] >= 80000000) & 
+                (df['漲幅'] >= 9.5) &
+                (df['收盤價'] == df['最高價'])
             ].copy()
             
-            # 整理要輸出的欄位
+            # 6. 整理要輸出的欄位
             show_cols = ['證券代號', '證券名稱', '開盤價', '最高價', '最低價', '收盤價', '漲跌價差', '成交金額']
             df_out = df_filtered[show_cols]
             df_out.columns = ['股票代號', '股票名稱', '開盤價', '最高價', '最低價', '收盤價', '漲跌價差', '成交金額(元)']
@@ -66,8 +87,6 @@ def send_telegram_notification(df, trade_date):
         return
         
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    
-    # 格式化顯示的日期
     formatted_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}" if trade_date else datetime.now().strftime('%Y-%m-%d')
     
     if df is None or df.empty:
@@ -98,6 +117,9 @@ if __name__ == "__main__":
     
     if result_df is not None:
         result_df.to_csv("result.csv", index=False, encoding="utf-8-sig")
+        
+    send_telegram_notification(result_df, trade_date)
+")
         
     # 執行 Telegram 發送
     send_telegram_notification(result_df, trade_date)
