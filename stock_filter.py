@@ -2,36 +2,31 @@ import requests
 import pandas as pd
 import os
 
-def debug_stocks():
-    # 這是原始的 API 網址，不更動
+def get_limit_up_stocks():
+    # 抓取證交所每日收盤資料
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALL"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        data = response.json()
-        
-        # 抓取表格的欄位名稱，這非常重要，我們要確認欄位名稱是否正確
-        columns = data['fields9']
-        rows = data['data9']
-        df = pd.DataFrame(rows, columns=columns)
-        
-        # 我們只取前 3 檔股票的資訊丟出來看
-        debug_msg = f"欄位名稱: {columns[:5]}...\n\n前3檔數據:\n{df.head(3).to_string()}"
-        return debug_msg
-        
-    except Exception as e:
-        return f"發生錯誤: {str(e)}"
+        data = requests.get(url, timeout=10).json()
+        # 尋找包含「漲停」資訊的資料結構
+        # 證交所 API 資料通常在 data9 或 data8，直接遍歷尋找
+        for key in data:
+            if isinstance(data[key], list) and len(data[key]) > 0:
+                # 篩選含有「漲停」字樣的行
+                for row in data[key]:
+                    if "漲停" in str(row):
+                        return row
+        return None
+    except:
+        return None
 
-def send_debug_message(message):
-    bot_token = os.getenv("TELEGRAM_TOKEN")
+def send_telegram(stock_info):
+    token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    
-    # 用 code 區塊格式化訊息，避免排版跑掉
-    msg = f"🔍 *【除錯資訊】*\n```\n{message}\n```"
-    requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+    msg = f"🚀 發現漲停股: {stock_info}" if stock_info else "今日無漲停資訊。"
+    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                  data={"chat_id": chat_id, "text": msg})
 
 if __name__ == "__main__":
-    msg = debug_stocks()
-    send_debug_message(msg)
+    info = get_limit_up_stocks()
+    send_telegram(info)
+
