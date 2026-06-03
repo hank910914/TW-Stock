@@ -1,507 +1,406 @@
-"""
-stock_filter.py
-台股篩選腳本 - 專為 GitHub Actions 環境設計
-資料來源: 台灣證券交易所 (TWSE) 公開 API + 玩股網
-篩選條件:
-  1. 成交金額 > 1 億元
-  2. 過去 20 個交易日漲幅 > 15%
-  3. 外資近 5 日連續 3~5 天淨買超
-  4. 今日與昨日收盤價皆上漲
-"""
-
 import os
-import time
+import re
+import sys
+import traceback
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
 
-# ─── 環境變數 ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+OUTPUT_CSV = "result.csv"
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    "Referer": "https://www.twse.com.tw/",
 }
 
-OUTPUT_CSV = "result.csv"
+session = requests.Session()
+session.headers.update(HEADERS)
 
 
-# ─── Telegram 通知 ────────────────────────────────────────────────────────────
 def send_telegram(message: str) -> None:
-    """透過 Telegram Bot API 發送訊息，失敗時僅印出警告，不中斷程式。"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram 環境變數未設定，跳過通知。")
+        print("[WARN] Telegram token/chat_id 未設定，略過通知")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
+
     try:
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = session.post(url, json=payload, timeout=20)
+        print(f"[INFO] Telegram status={resp.status_code}")
         resp.raise_for_status()
-        print("[INFO] Telegram 通知發送成功。")
     except Exception as e:
         print(f"[WARN] Telegram 發送失敗: {e}")
 
 
-# ─── 取得交易日曆 ─────────────────────────────────────────────────────────────
-def get_recent_trading_dates(n: int = 30) -> list[str]:
-    """
-    從 TWSE 取得最近 n 個交易日的日期清單 (格式 YYYYMMDD)。
-    使用大盤指數歷史資料來推算交易日。
-    """
-    print("[INFO] 取得近期交易日清單...")
-    end_date = datetime.today()
-    # 往前取兩個月資料確保涵蓋足夠交易日
-    start_date = end_date - timedelta(days=90)
-    url = (
-        "https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST"
-        f"?date={end_date.strftime('%Y%m%d')}&response=json"
-    )
+def clean_num(x):
+    if pd.isna(x):
+        return pd.NA
+    s = str(x).strip()
+    s = s.replace(",", "").replace(" ", "")
+    s = s.replace("－", "-").replace("—", "-").replace("–", "-")
+    s = s.replace("+", "")
+    s = s.replace("%", "")
+    s = re.sub(r"[^\d\.\-]", "", s)
+    if s in {"", "-", "."}:
+        return pd.NA
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("stat") != "OK":
-            raise ValueError("TWSE 大盤資料回傳異常")
-        # 取資料中的日期欄 (民國年轉西元)
-        rows = data.get("data", [])
-        dates = []
-        for row in rows:
-            roc_date = row[0].replace("/", "")  # e.g. "113/05/01" -> "1130501"
-            year = int(roc_date[:3]) + 1911
-            mmdd = roc_date[3:]
-            dates.append(f"{year}{mmdd}")
-        dates = sorted(set(dates), reverse=True)
-        print(f"[INFO] 取得 {len(dates)} 個交易日 (本月)。")
-        return dates[:n]
-    except Exception as e:
-        print(f"[WARN] 取得交易日失敗，改用推算方式: {e}")
-        # Fallback: 排除週末估算
-        dates = []
-        cur = end_date
-        while len(dates) < n:
-            if cur.weekday() < 5:
-                dates.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return dates
+        return float(s)
+    except:
+        return pd.NA
 
 
-# ─── 取得全市場成交量排行 (TWSE) ──────────────────────────────────────────────
-def fetch_twse_daily_trades(date: str) -> pd.DataFrame:
-    """
-    取得指定日期 TWSE 所有上市股票的成交資料。
-    回傳 DataFrame: [stock_id, stock_name, close, change, volume_value]
-    """
-    url = (
-        f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
-        f"?date={date}&type=ALLBUT0999&response=json"
-    )
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("stat") != "OK":
-            print(f"[WARN] {date} TWSE 資料回傳異常: {data.get('stat')}")
-            return pd.DataFrame()
+def is_numeric_stock_id(s):
+    return bool(re.fullmatch(r"\d{4}", str(s).strip()))
 
-      def fetch_twse_daily_trades(date: str) -> pd.DataFrame:
+
+def get_recent_dates(days=40):
+    base = datetime.now()
+    dates = []
+    d = base
+    while len(dates) < days:
+        if d.weekday() < 5:
+            dates.append(d.strftime("%Y%m%d"))
+        d -= timedelta(days=1)
+    return dates
+
+
+def fetch_daily_market(date_str: str) -> pd.DataFrame:
     """
-    【改良版】動態搜尋資料，自動適應證交所欄位變動
+    抓上市個股日資料（成交金額、收盤價、漲跌等）
+    優先用 TWSE 公開日資料端點，並兼容欄位變動。
     """
-    url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type=ALLBUT0999&response=json"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        data = resp.json()
-        
-        # 核心修改：遍歷所有表格結構，找出包含「證券代號」的欄位表
-        target_df = None
-        
-        # 檢查 data 中的 tables (新版格式)
-        if "tables" in data:
-            for table in data["tables"]:
-                if any("證券代號" in str(c) for c in table.get("fields", [])):
-                    target_df = pd.DataFrame(table["data"], columns=table["fields"])
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date_str}&type=ALLBUT0999&response=json",
+        f"https://www.twse.com.tw/exchangeReport/MI_INDEX?date={date_str}&response=json",
+    ]
+
+    for url in urls:
+        try:
+            print(f"[INFO] 抓日資料: {url}")
+            resp = session.get(url, timeout=30)
+            print(f"[DEBUG] market status={resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+            print(f"[DEBUG] market keys={list(data.keys())}")
+
+            if data.get("stat") not in {"OK", "ok", "Ok"}:
+                print(f"[WARN] {date_str} market stat={data.get('stat')}")
+                continue
+
+            rows = None
+            fields = None
+
+            for kf, kd in [
+                ("fields9", "data9"),
+                ("fields8", "data8"),
+                ("fields", "data"),
+            ]:
+                if data.get(kf) and data.get(kd):
+                    fields = data.get(kf)
+                    rows = data.get(kd)
                     break
-        
-        # 若表格中找不到，再檢查舊版格式
-        if target_df is None:
-            for i in range(10): # 檢查 data8, data9...
-                key_data = f"data{i}"
-                key_fields = f"fields{i}"
-                if key_data in data and key_fields in data:
-                    if any("證券代號" in str(c) for c in data[key_fields]):
-                        target_df = pd.DataFrame(data[key_data], columns=data[key_fields])
-                        break
-        
-        if target_df is None:
-            print(f"[WARN] {date} 找不到包含「證券代號」的資料表。")
-            return pd.DataFrame()
 
-        # 【關鍵清洗】：移除欄位名稱的任何空格、換行或括號，避免比對失效
-        target_df.columns = [str(c).replace(" ", "").replace("(", "").replace(")", "").replace("\n", "") for c in target_df.columns]
+            if not fields or not rows:
+                print(f"[WARN] {date_str} 找不到資料表格")
+                continue
 
-        # 映射欄位 (使用模糊匹配的概念)
-        col_map = {
-            "證券代號": "stock_id",
-            "證券名稱": "stock_name",
-            "收盤價": "close",
-            "漲跌價差": "change",
-            "成交金額": "volume_value"
-        }
-        
-        # 執行重命名
-        target_df.rename(columns=col_map, inplace=True)
-        
-        # 確保必要欄位存在
-        required = ["stock_id", "stock_name", "close", "change", "volume_value"]
-        if not all(col in target_df.columns for col in required):
-            print(f"[WARN] 欄位缺失。當前欄位: {list(target_df.columns)}")
-            return pd.DataFrame()
+            print(f"[DEBUG] market fields={fields[:10]}")
+            df = pd.DataFrame(rows, columns=fields)
 
-        # 數值清洗
-        for col in ["close", "change", "volume_value"]:
-            target_df[col] = pd.to_numeric(target_df[col].astype(str).str.replace(",", "").str.replace("+", ""), errors="coerce")
+            colmap = {}
+            for c in df.columns:
+                if "證券代號" in c or c in ["股票代號", "代號", "證券代號"]:
+                    colmap[c] = "stock_id"
+                elif "證券名稱" in c or c in ["股票名稱", "名稱"]:
+                    colmap[c] = "stock_name"
+                elif "收盤價" in c or c == "收盤":
+                    colmap[c] = "close"
+                elif "漲跌" in c and "價差" in c:
+                    colmap[c] = "change"
+                elif "漲跌價差" in c:
+                    colmap[c] = "change"
+                elif "成交金額" in c:
+                    colmap[c] = "turnover"
 
-        return target_df[required].dropna(subset=["stock_id"])
+            df = df.rename(columns=colmap)
 
-    except Exception as e:
-        print(f"[ERROR] 抓取資料發生異常: {e}")
-        return pd.DataFrame()
+            required = ["stock_id", "stock_name", "close", "change", "turnover"]
+            if not all(c in df.columns for c in required):
+                print(f"[WARN] {date_str} 欄位不足: {df.columns.tolist()}")
+                continue
 
+            df = df[df["stock_id"].apply(is_numeric_stock_id)].copy()
+            for c in ["close", "change", "turnover"]:
+                df[c] = df[c].apply(clean_num)
 
-        print(f"[INFO] {date} 取得 {len(rows)} 筆上市資料，欄位: {fields}")
+            df = df.dropna(subset=["close", "change", "turnover"])
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["change"] = pd.to_numeric(df["change"], errors="coerce")
+            df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
+            df = df.dropna(subset=["close", "change", "turnover"])
 
-        df = pd.DataFrame(rows, columns=fields)
+            print(f"[INFO] {date_str} market rows={len(df)}")
+            return df[["stock_id", "stock_name", "close", "change", "turnover"]].copy()
 
-        # 標準化欄位名稱
-        col_map = {}
-        for col in df.columns:
-            if "證券代號" in col or "股票代號" in col:
-                col_map[col] = "stock_id"
-            elif "證券名稱" in col or "股票名稱" in col:
-                col_map[col] = "stock_name"
-            elif "收盤" in col:
-                col_map[col] = "close"
-            elif "漲跌價差" in col or "漲跌" in col:
-                col_map[col] = "change"
-            elif "成交金額" in col:
-                col_map[col] = "volume_value"
-        df.rename(columns=col_map, inplace=True)
+        except Exception as e:
+            print(f"[WARN] market fetch failed {date_str}: {e}")
 
-        required = ["stock_id", "stock_name", "close", "change", "volume_value"]
-        for col in required:
-            if col not in df.columns:
-                print(f"[WARN] 缺少欄位 {col}，跳過此日期。")
-                return pd.DataFrame()
-
-        # 清理數值 (移除逗號、+/- 符號)
-        for col in ["close", "change", "volume_value"]:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("+", "", regex=False)
-                .str.strip()
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 過濾非純數字代號 (ETF、權證等)
-        df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
-        df.reset_index(drop=True, inplace=True)
-        return df[["stock_id", "stock_name", "close", "change", "volume_value"]]
-
-    except Exception as e:
-        print(f"[ERROR] 取得 {date} TWSE 資料失敗: {e}")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
-# ─── 取得外資買賣超資料 (TWSE) ────────────────────────────────────────────────
-def fetch_foreign_net_buy(date: str) -> pd.DataFrame:
+def fetch_foreign_daily(date_str: str) -> pd.DataFrame:
     """
-    取得指定日期外資買賣超資料。
-    回傳 DataFrame: [stock_id, foreign_net]  (正數=買超, 負數=賣超)
+    抓外資每日淨買超，回傳 [stock_id, foreign_net]
     """
-    url = (
-        f"https://www.twse.com.tw/rwd/zh/fund/T86"
-        f"?date={date}&selectType=ALLBUT0999&response=json"
-    )
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("stat") != "OK":
-            print(f"[WARN] {date} 外資資料異常: {data.get('stat')}")
-            return pd.DataFrame()
+    urls = [
+        f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_str}&selectType=ALLBUT0999&response=json",
+        f"https://www.twse.com.tw/fund/T86?date={date_str}&selectType=ALLBUT0999&response=json",
+    ]
 
-        fields = data.get("fields", [])
-        rows = data.get("data", [])
-        if not fields or not rows:
-            return pd.DataFrame()
+    for url in urls:
+        try:
+            print(f"[INFO] 抓外資資料: {url}")
+            resp = session.get(url, timeout=30)
+            print(f"[DEBUG] foreign status={resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+            print(f"[DEBUG] foreign keys={list(data.keys())}")
 
-        df = pd.DataFrame(rows, columns=fields)
+            if data.get("stat") not in {"OK", "ok", "Ok"}:
+                print(f"[WARN] {date_str} foreign stat={data.get('stat')}")
+                continue
 
-        col_map = {}
-        for col in df.columns:
-            if "證券代號" in col:
-                col_map[col] = "stock_id"
-            elif "外陸資買賣超股數" in col or "外資及陸資買賣超" in col:
-                col_map[col] = "foreign_net"
-            # 部分版本欄位名稱不同，兜底處理
-            elif col in ["外資買賣超股數(不含外資自營商)", "外資及陸資(不含外資自營商)買賣超股數"]:
-                col_map[col] = "foreign_net"
+            rows = data.get("data", [])
+            fields = data.get("fields", [])
+            if not rows or not fields:
+                print(f"[WARN] {date_str} 外資資料無 rows/fields")
+                continue
 
-        df.rename(columns=col_map, inplace=True)
+            print(f"[DEBUG] foreign fields={fields[:10]}")
+            df = pd.DataFrame(rows, columns=fields)
 
-        if "stock_id" not in df.columns:
-            print(f"[WARN] {date} 外資資料缺少 stock_id 欄位。fields={fields}")
-            return pd.DataFrame()
+            stock_col = None
+            net_col = None
 
-        # 若沒有 foreign_net，嘗試用「買進」-「賣出」計算
-        if "foreign_net" not in df.columns:
-            buy_col = next((c for c in df.columns if "買進" in c), None)
-            sell_col = next((c for c in df.columns if "賣出" in c), None)
-            if buy_col and sell_col:
-                df["foreign_net"] = (
-                    pd.to_numeric(df[buy_col].str.replace(",", "", regex=False), errors="coerce") -
-                    pd.to_numeric(df[sell_col].str.replace(",", "", regex=False), errors="coerce")
-                )
-            else:
-                print(f"[WARN] {date} 無法計算外資買賣超。")
-                return pd.DataFrame()
+            for c in df.columns:
+                if "證券代號" in c or c in ["證券代號", "代號"]:
+                    stock_col = c
+                if "外資" in c and "買賣超" in c:
+                    net_col = c
+                if "買賣超股數" in c and "外資" in c:
+                    net_col = c
 
-        df["foreign_net"] = (
-            df["foreign_net"]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.strip()
-        )
-        df["foreign_net"] = pd.to_numeric(df["foreign_net"], errors="coerce")
-        df = df[df["stock_id"].str.match(r"^\d{4}$", na=False)].copy()
-        return df[["stock_id", "foreign_net"]].dropna()
+            if stock_col is None:
+                print(f"[WARN] {date_str} 找不到股票代號欄位")
+                continue
 
-    except Exception as e:
-        print(f"[ERROR] 取得 {date} 外資資料失敗: {e}")
-        return pd.DataFrame()
+            if net_col is None:
+                buy_col = next((c for c in df.columns if "買進" in c and "外資" in c), None)
+                sell_col = next((c for c in df.columns if "賣出" in c and "外資" in c), None)
+                if buy_col and sell_col:
+                    df["foreign_net"] = df[buy_col].apply(clean_num) - df[sell_col].apply(clean_num)
+                    net_col = "foreign_net"
+                else:
+                    print(f"[WARN] {date_str} 找不到外資淨買超欄位")
+                    continue
+
+            out = pd.DataFrame()
+            out["stock_id"] = df[stock_col].astype(str).str.strip()
+            out["foreign_net"] = df[net_col].apply(clean_num)
+            out = out[out["stock_id"].apply(is_numeric_stock_id)]
+            out["foreign_net"] = pd.to_numeric(out["foreign_net"], errors="coerce")
+            out = out.dropna(subset=["foreign_net"])
+
+            print(f"[INFO] {date_str} foreign rows={len(out)}")
+            return out[["stock_id", "foreign_net"]].copy()
+
+        except Exception as e:
+            print(f"[WARN] foreign fetch failed {date_str}: {e}")
+
+    return pd.DataFrame()
 
 
-# ─── 主篩選邏輯 ───────────────────────────────────────────────────────────────
+def get_latest_valid_trading_dates():
+    dates = get_recent_dates(40)
+    market_cache = {}
+
+    valid_dates = []
+    for d in dates:
+        df = fetch_daily_market(d)
+        if not df.empty:
+            valid_dates.append(d)
+            market_cache[d] = df
+        if len(valid_dates) >= 25:
+            break
+
+    return valid_dates, market_cache
+
+
+def foreign_consecutive_count(series):
+    cnt = 0
+    for v in series:
+        if pd.isna(v):
+            break
+        if v > 0:
+            cnt += 1
+        else:
+            break
+    return cnt
+
+
 def main():
-    today_str = datetime.today().strftime("%Y-%m-%d")
-    print(f"\n{'='*60}")
-    print(f"[INFO] 台股篩選啟動 | 日期: {today_str}")
-    print(f"{'='*60}\n")
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    print("=" * 70)
+    print(f"[INFO] stock_filter start: {run_date}")
+    print("=" * 70)
 
-    # 1. 取得近 30 個交易日
-    trading_dates = get_recent_trading_dates(n=30)
-    if len(trading_dates) < 22:
-        msg = f"❌ [{today_str}] 無法取得足夠交易日資料，篩選中止。"
-        print(f"[ERROR] {msg}")
-        send_telegram(msg)
-        return
+    try:
+        valid_dates, market_cache = get_latest_valid_trading_dates()
+        print(f"[INFO] valid trading dates={valid_dates[:10]}")
+        if len(valid_dates) < 2:
+            msg = f"❌ {run_date} 無法取得足夠交易日資料。"
+            print(msg)
+            pd.DataFrame().to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+            send_telegram(msg)
+            return
 
-    today_date = trading_dates[0]
-    yesterday_date = trading_dates[1]
-    date_20d_ago = trading_dates[20]  # 約 1 個月前 (20 交易日)
-    dates_5d = trading_dates[:5]  # 近 5 個交易日 (含今日)
+        today_date = valid_dates[0]
+        yesterday_date = valid_dates[1]
+        date_20d_ago = valid_dates[20] if len(valid_dates) > 20 else None
+        if not date_20d_ago:
+            msg = f"❌ {run_date} 無法取得 20 個交易日前資料。"
+            print(msg)
+            pd.DataFrame().to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+            send_telegram(msg)
+            return
 
-    print(f"[INFO] 今日: {today_date}, 昨日: {yesterday_date}, 20日前: {date_20d_ago}")
-    print(f"[INFO] 近 5 個交易日: {dates_5d}")
+        print(f"[INFO] today={today_date}, yesterday={yesterday_date}, 20d_ago={date_20d_ago}")
 
-    # 2. 取得今日成交資料
-    print("\n[INFO] ── 抓取今日成交資料 ──")
-    df_today = fetch_twse_daily_trades(today_date)
-    if df_today.empty:
-        msg = f"❌ [{today_str}] 今日成交資料取得失敗，可能非交易日或資料未更新。"
-        print(f"[WARN] {msg}")
-        send_telegram(msg)
-        return
-    time.sleep(1)
+        df_today = market_cache.get(today_date, pd.DataFrame())
+        df_yday = market_cache.get(yesterday_date, fetch_daily_market(yesterday_date))
+        df_20d = market_cache.get(date_20d_ago, fetch_daily_market(date_20d_ago))
 
-    # 3. 取得昨日成交資料
-    print("\n[INFO] ── 抓取昨日成交資料 ──")
-    df_yesterday = fetch_twse_daily_trades(yesterday_date)
-    if df_yesterday.empty:
-        print("[WARN] 昨日資料取得失敗，技術面條件將無法驗證。")
-    time.sleep(1)
+        if df_today.empty or df_20d.empty:
+            msg = f"❌ {run_date} 今日或 20 日前資料取得失敗。"
+            print(msg)
+            pd.DataFrame().to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+            send_telegram(msg)
+            return
 
-    # 4. 取得 20 日前收盤價
-    print("\n[INFO] ── 抓取 20 日前收盤價 ──")
-    df_20d = fetch_twse_daily_trades(date_20d_ago)
-    if df_20d.empty:
-        msg = f"❌ [{today_str}] 20 日前資料取得失敗，無法計算漲幅。"
-        print(f"[WARN] {msg}")
-        send_telegram(msg)
-        return
-    time.sleep(1)
+        foreign_dates = valid_dates[:5]
+        foreign_dfs = []
+        for d in foreign_dates:
+            df_f = fetch_foreign_daily(d)
+            if not df_f.empty:
+                df_f = df_f.rename(columns={"foreign_net": f"foreign_{d}"})
+                foreign_dfs.append(df_f.set_index("stock_id"))
+        if not foreign_dfs:
+            msg = f"❌ {run_date} 外資資料全部抓取失敗。"
+            print(msg)
+            pd.DataFrame().to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+            send_telegram(msg)
+            return
 
-    # 5. 取得近 5 日外資買賣超
-    print("\n[INFO] ── 抓取近 5 日外資買賣超 ──")
-    foreign_list = []
-    for d in dates_5d:
-        df_f = fetch_foreign_net_buy(d)
-        if not df_f.empty:
-            df_f = df_f.rename(columns={"foreign_net": f"foreign_{d}"})
-            foreign_list.append(df_f.set_index("stock_id"))
-        time.sleep(1)
+        df_foreign = pd.concat(foreign_dfs, axis=1).reset_index()
+        print(f"[INFO] foreign merged rows={len(df_foreign)}")
 
-    if not foreign_list:
-        msg = f"❌ [{today_str}] 外資資料完全取得失敗。"
-        print(f"[ERROR] {msg}")
-        send_telegram(msg)
-        return
-
-    df_foreign = pd.concat(foreign_list, axis=1).reset_index()
-    df_foreign.rename(columns={"index": "stock_id"}, inplace=True)
-    print(f"[INFO] 外資資料合併完成，共 {len(df_foreign)} 筆。")
-
-    # ─── 開始篩選 ─────────────────────────────────────────────────────────────
-    print("\n[INFO] ── 開始套用篩選條件 ──")
-
-    # 合併今日 + 昨日 + 20日前資料
-    df = df_today.copy()
-    df = df.rename(columns={"close": "close_today", "change": "change_today"})
-
-    if not df_yesterday.empty:
-        df_y = df_yesterday[["stock_id", "change"]].rename(columns={"change": "change_yesterday"})
-        df = df.merge(df_y, on="stock_id", how="left")
-    else:
-        df["change_yesterday"] = float("nan")
-
-    df_20 = df_20d[["stock_id", "close"]].rename(columns={"close": "close_20d"})
-    df = df.merge(df_20, on="stock_id", how="left")
-
-    # 合併外資
-    df = df.merge(df_foreign, on="stock_id", how="left")
-
-    print(f"[INFO] 合併後總筆數: {len(df)}")
-
-    # 條件 1: 成交金額 > 1 億 (單位: 元)
-    cond1 = df["volume_value"] > 1e8
-    print(f"[FILTER] 條件1 (成交金額 > 1億): {cond1.sum()} 筆")
-
-    # 條件 2: 近 20 個交易日漲幅 > 15%
-    df["pct_change_20d"] = (df["close_today"] - df["close_20d"]) / df["close_20d"] * 100
-    cond2 = df["pct_change_20d"] > 15
-    print(f"[FILTER] 條件2 (20日漲幅 > 15%): {cond2.sum()} 筆")
-
-    # 條件 3: 外資近 5 日連續 3~5 天淨買超
-    foreign_cols = [c for c in df.columns if c.startswith("foreign_")]
-    def check_foreign_consecutive(row):
-        """計算從最新日起連續買超天數，需達 3 天以上。"""
-        vals = [row.get(c, float("nan")) for c in foreign_cols]
-        count = 0
-        for v in vals:  # foreign_cols 已按日期降序排列 (最新在前)
-            if pd.isna(v):
-                break
-            if v > 0:
-                count += 1
-            else:
-                break
-        return 3 <= count <= 5
-
-    if foreign_cols:
-        cond3 = df.apply(check_foreign_consecutive, axis=1)
-    else:
-        cond3 = pd.Series([False] * len(df))
-    print(f"[FILTER] 條件3 (外資連續3-5天買超): {cond3.sum()} 筆")
-
-    # 條件 4: 今日與昨日收盤價皆上漲
-    cond4_today = df["change_today"] > 0
-    cond4_yest = df["change_yesterday"] > 0
-    cond4 = cond4_today & cond4_yest
-    print(f"[FILTER] 條件4 (今日+昨日皆收漲): {cond4.sum()} 筆")
-
-    # 綜合篩選
-    df_result = df[cond1 & cond2 & cond3 & cond4].copy()
-    print(f"\n[INFO] ✅ 符合所有條件的股票: {len(df_result)} 筆")
-
-    # ─── 計算外資連續買超天數 ─────────────────────────────────────────────────
-    def count_consecutive_buy(row):
-        vals = [row.get(c, float("nan")) for c in foreign_cols]
-        count = 0
-        for v in vals:
-            if pd.isna(v):
-                break
-            if v > 0:
-                count += 1
-            else:
-                break
-        return count
-
-    if not df_result.empty:
-        df_result["foreign_consecutive_days"] = df_result.apply(count_consecutive_buy, axis=1)
-        df_result["pct_change_20d"] = df_result["pct_change_20d"].round(2)
-
-        # 整理輸出欄位
-        output_cols = [
-            "stock_id", "stock_name", "close_today",
-            "change_today", "volume_value",
-            "pct_change_20d", "foreign_consecutive_days"
-        ]
-        df_output = df_result[output_cols].copy()
-        df_output.columns = [
-            "股票代號", "股票名稱", "今日收盤價",
-            "今日漲跌", "成交金額(元)",
-            "20日漲幅(%)", "外資連續買超(天)"
-        ]
-
-        # 儲存 CSV
-        df_output.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-        print(f"[INFO] 結果已儲存至 {OUTPUT_CSV}")
-
-        # 組成 Telegram 訊息
-        lines = [
-            f"📈 <b>台股篩選結果</b>",
-            f"🗓 日期: {today_str}",
-            f"✅ 符合條件共 {len(df_result)} 支",
-            "─────────────────────",
-        ]
-        for _, row in df_result.iterrows():
-            lines.append(
-                f"🔹 <b>{row['stock_name']} ({row['stock_id']})</b>\n"
-                f"   收盤: {row['close_today']:.2f}  漲跌: {row['change_today']:+.2f}\n"
-                f"   20日漲幅: {row['pct_change_20d']:.2f}%\n"
-                f"   外資連買: {int(row['foreign_consecutive_days'])} 天"
-            )
-        message = "\n".join(lines)
-
-    else:
-        # 無符合標的
-        df_output = pd.DataFrame(columns=[
-            "股票代號", "股票名稱", "今日收盤價",
-            "今日漲跌", "成交金額(元)",
-            "20日漲幅(%)", "外資連續買超(天)"
-        ])
-        df_output.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-        print("[INFO] 今日無符合條件標的，已儲存空白 CSV。")
-        message = (
-            f"📭 <b>台股篩選結果</b>\n"
-            f"🗓 日期: {today_str}\n"
-            f"今日無符合所有篩選條件的標的。"
+        df = df_today.rename(columns={"close": "close_today", "change": "change_today", "turnover": "turnover_today"}).copy()
+        df = df.merge(
+            df_yday[["stock_id", "change"]].rename(columns={"change": "change_yesterday"}),
+            on="stock_id",
+            how="left",
         )
+        df = df.merge(
+            df_20d[["stock_id", "close"]].rename(columns={"close": "close_20d"}),
+            on="stock_id",
+            how="left",
+        )
+        df = df.merge(df_foreign, on="stock_id", how="left")
 
-    print(f"\n[INFO] Telegram 訊息:\n{message}\n")
-    send_telegram(message)
-    print("[INFO] 篩選完成！")
+        df["pct_20d"] = (df["close_today"] - df["close_20d"]) / df["close_20d"] * 100
+        foreign_cols = [c for c in df.columns if c.startswith("foreign_")]
+        print(f"[INFO] foreign cols={foreign_cols}")
+
+        def check_foreign(row):
+            vals = [row.get(c, pd.NA) for c in foreign_cols]
+            cnt = foreign_consecutive_count(vals)
+            return 3 <= cnt <= 5, cnt
+
+        foreign_check = df.apply(check_foreign, axis=1, result_type="expand")
+        df["foreign_ok"] = foreign_check[0]
+        df["foreign_consecutive_days"] = foreign_check[1]
+
+        cond1 = df["turnover_today"] > 1e8
+        cond2 = df["pct_20d"] > 15
+        cond3 = df["foreign_ok"] == True
+        cond4 = (df["change_today"] > 0) & (df["change_yesterday"] > 0)
+
+        print(f"[FILTER] turnover > 1e8: {int(cond1.sum())}")
+        print(f"[FILTER] pct_20d > 15: {int(cond2.sum())}")
+        print(f"[FILTER] foreign 3~5 days: {int(cond3.sum())}")
+        print(f"[FILTER] up today & yesterday: {int(cond4.sum())}")
+
+        result = df[cond1 & cond2 & cond3 & cond4].copy()
+        print(f"[INFO] matched rows={len(result)}")
+
+        if result.empty:
+            out = pd.DataFrame(columns=[
+                "日期", "股票名稱", "代號", "今日收盤價", "20日漲幅(%)", "成交金額(元)", "外資連買天數", "法人籌碼狀態"
+            ])
+            out.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+            msg = f"📭 {run_date} 無符合條件的標的。"
+            print(msg)
+            send_telegram(msg)
+            return
+
+        result["法人籌碼狀態"] = result["foreign_consecutive_days"].apply(lambda x: f"外資連續淨買超 {int(x)} 天")
+        result["20日漲幅(%)"] = result["pct_20d"].round(2)
+        result["今日收盤價"] = result["close_today"].round(2)
+        result["成交金額(元)"] = result["turnover_today"].round(0).astype("Int64")
+        result["日期"] = run_date
+
+        out = result[[
+            "日期", "stock_name", "stock_id", "今日收盤價",
+            "20日漲幅(%)", "成交金額(元)", "foreign_consecutive_days", "法人籌碼狀態"
+        ]].copy()
+        out.columns = ["日期", "股票名稱", "代號", "今日收盤價", "20日漲幅(%)", "成交金額(元)", "外資連買天數", "法人籌碼狀態"]
+        out.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+        print(f"[INFO] saved {OUTPUT_CSV}")
+
+        lines = [f"📈 <b>台股篩選結果</b>", f"日期：{run_date}", f"符合條件：{len(result)} 檔", ""]
+        for _, r in result.iterrows():
+            lines.append(
+                f"• <b>{r['stock_name']}</b> ({r['stock_id']})\n"
+                f"  漲幅：{r['20日漲幅(%)']:.2f}%\n"
+                f"  法人籌碼：{r['法人籌碼狀態']}\n"
+                f"  收盤價：{r['close_today']:.2f}，成交金額：{int(r['turnover_today']):,}"
+            )
+        msg = "\n".join(lines)
+        send_telegram(msg)
+        print("[INFO] done")
+
+    except Exception as e:
+        print(f"[ERROR] unexpected: {e}")
+        traceback.print_exc()
+        try:
+            pd.DataFrame().to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+        except:
+            pass
+        send_telegram(f"❌ {run_date} 篩選腳本執行失敗：{e}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        today_str = datetime.today().strftime("%Y-%m-%d")
-        err_msg = f"❌ [{today_str}] 台股篩選腳本發生未預期錯誤: {e}"
-        print(f"[ERROR] {err_msg}")
-        import traceback
-        traceback.print_exc()
-        send_telegram(err_msg)
+    main()
