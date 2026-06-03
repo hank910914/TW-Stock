@@ -114,15 +114,70 @@ def fetch_twse_daily_trades(date: str) -> pd.DataFrame:
             print(f"[WARN] {date} TWSE 資料回傳異常: {data.get('stat')}")
             return pd.DataFrame()
 
-        # 找欄位索引 (不同時期欄位順序可能略有差異，以名稱比對)
-        fields = data.get("fields9", [])
-        rows = data.get("data9", [])
-        if not fields or not rows:
-            fields = data.get("fields8", [])
-            rows = data.get("data8", [])
-        if not fields or not rows:
-            print(f"[WARN] {date} 找不到資料欄位。")
+      def fetch_twse_daily_trades(date: str) -> pd.DataFrame:
+    """
+    【改良版】動態搜尋資料，自動適應證交所欄位變動
+    """
+    url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type=ALLBUT0999&response=json"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        data = resp.json()
+        
+        # 核心修改：遍歷所有表格結構，找出包含「證券代號」的欄位表
+        target_df = None
+        
+        # 檢查 data 中的 tables (新版格式)
+        if "tables" in data:
+            for table in data["tables"]:
+                if any("證券代號" in str(c) for c in table.get("fields", [])):
+                    target_df = pd.DataFrame(table["data"], columns=table["fields"])
+                    break
+        
+        # 若表格中找不到，再檢查舊版格式
+        if target_df is None:
+            for i in range(10): # 檢查 data8, data9...
+                key_data = f"data{i}"
+                key_fields = f"fields{i}"
+                if key_data in data and key_fields in data:
+                    if any("證券代號" in str(c) for c in data[key_fields]):
+                        target_df = pd.DataFrame(data[key_data], columns=data[key_fields])
+                        break
+        
+        if target_df is None:
+            print(f"[WARN] {date} 找不到包含「證券代號」的資料表。")
             return pd.DataFrame()
+
+        # 【關鍵清洗】：移除欄位名稱的任何空格、換行或括號，避免比對失效
+        target_df.columns = [str(c).replace(" ", "").replace("(", "").replace(")", "").replace("\n", "") for c in target_df.columns]
+
+        # 映射欄位 (使用模糊匹配的概念)
+        col_map = {
+            "證券代號": "stock_id",
+            "證券名稱": "stock_name",
+            "收盤價": "close",
+            "漲跌價差": "change",
+            "成交金額": "volume_value"
+        }
+        
+        # 執行重命名
+        target_df.rename(columns=col_map, inplace=True)
+        
+        # 確保必要欄位存在
+        required = ["stock_id", "stock_name", "close", "change", "volume_value"]
+        if not all(col in target_df.columns for col in required):
+            print(f"[WARN] 欄位缺失。當前欄位: {list(target_df.columns)}")
+            return pd.DataFrame()
+
+        # 數值清洗
+        for col in ["close", "change", "volume_value"]:
+            target_df[col] = pd.to_numeric(target_df[col].astype(str).str.replace(",", "").str.replace("+", ""), errors="coerce")
+
+        return target_df[required].dropna(subset=["stock_id"])
+
+    except Exception as e:
+        print(f"[ERROR] 抓取資料發生異常: {e}")
+        return pd.DataFrame()
+
 
         print(f"[INFO] {date} 取得 {len(rows)} 筆上市資料，欄位: {fields}")
 
