@@ -1,7 +1,6 @@
 import requests
 import pandas as pd
 import io
-import os
 
 def run_filter():
     url = "https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&type=ALL"
@@ -11,26 +10,39 @@ def run_filter():
         response = requests.get(url, headers=headers, timeout=20)
         response.encoding = 'big5'
         
-        # 尋找「證券代號」所在的行，作為表格開始
         lines = response.text.splitlines()
-        start_idx = 0
+        # 尋找關鍵表頭
+        data_start_index = 0
         for i, line in enumerate(lines):
             if '證券代號' in line:
-                start_idx = i
+                data_start_index = i
                 break
         
-        # 讀取個股表格
-        df = pd.read_csv(io.StringIO("\n".join(lines[start_idx:])))
+        df = pd.read_csv(io.StringIO("\n".join(lines[data_start_index:])))
         
-        # 強制只保留「漲停」字樣的股票
-        # 檢查該列是否有「漲停」二字
-        mask = df.apply(lambda row: row.astype(str).str.contains('漲停').any(), axis=1)
-        df_final = df[mask]
+        # --- 除錯與篩選邏輯 ---
+        # 1. 確保欄位名稱正確 (證交所可能會改名，我們用模糊比對)
+        # 檢查該列是否包含「漲停」字樣
+        # 這裡改用字串比對，容錯率更高
+        def check_is_limit_up(row):
+            row_str = row.to_string()
+            return '漲停' in row_str
         
-        # 強制寫入 result.csv (覆蓋模式)
-        df_final.to_csv("result.csv", index=False, encoding="utf-8-sig")
-        print(f"✅ 檔案寫入成功，共 {len(df_final)} 支股票")
+        df_limit_up = df[df.apply(check_is_limit_up, axis=1)]
         
+        # 2. 顯示除錯訊息到 Log
+        print(f"DEBUG: 原始資料總筆數 {len(df)}")
+        print(f"DEBUG: 篩選出漲停數 {len(df_limit_up)}")
+        
+        # 3. 寫入檔案
+        if not df_limit_up.empty:
+            df_limit_up.to_csv("result.csv", index=False, encoding="utf-8-sig")
+            print("✅ 成功寫入漲停股至 result.csv")
+        else:
+            # 如果還是沒資料，至少存一個空的表確認程式有跑過
+            df.head(0).to_csv("result.csv", index=False, encoding="utf-8-sig")
+            print("⚠️ 今日篩選結果為空，已更新 result.csv 為空表")
+            
     except Exception as e:
         print(f"❌ 發生錯誤: {e}")
 
