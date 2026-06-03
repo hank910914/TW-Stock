@@ -1,37 +1,28 @@
-name: stock filter
-
+name: 台股塞選器
 on:
   schedule:
-    - cron: "30 9 * * 1-5"
-  workflow_dispatch:
+    - cron: '30 11 * * 1-5'  # 台灣時間 19:30
+  workflow_dispatch:        # 允許手動測試
 
 jobs:
-  run:
+  filter:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write       # 確保有寫入權限以覆蓋 result.csv
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
-
-      - name: Install packages
+          python-version: '3.9'
+      - name: Install dependencies
+        run: pip install requests pandas lxml
+      - name: Run Filter
+        run: python stock_filter.py
+      - name: Commit and Push
         run: |
-          python -m pip install --upgrade pip
-          pip install pandas requests
-
-      - name: Run script
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python stock_filter.py
-
-      - name: Upload result
-        uses: actions/upload-artifact@v4
-        with:
-          name: result-csv
-          path: result.csv
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add result.csv
+          git commit -m "Daily update result.csv" || exit 0
+          git push
