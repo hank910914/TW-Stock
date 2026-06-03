@@ -1,38 +1,37 @@
-name: 每天盤後台股篩選自動化
+name: stock filter
 
 on:
-  workflow_dispatch: # 手動觸發
   schedule:
-    - cron: '30 7 * * 1-5' # 國際標準時間 07:30 相當於台灣時間 15:30
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch:
 
 jobs:
-  run_scraper:
+  run:
     runs-on: ubuntu-latest
 
     steps:
-    - name: 檢查程式碼
-      uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: 設定 Python 環境
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: 安裝必要套件
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests pandas
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
 
-    - name: 執行選股爬蟲並傳送通知
-      # 關鍵就在這裡：必須把保險箱變數傳給 Python
-      env:
-        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      run: python stock_filter.py
+      - name: Run script
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python stock_filter.py
 
-    - name: 自動將更新結果存回儲存庫
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "actions-user"
-        git add result.csv
-        git diff --quiet && git diff --staged --quiet || (git commit -m "自動更新今日篩選結果" && git push)
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-csv
+          path: result.csv
