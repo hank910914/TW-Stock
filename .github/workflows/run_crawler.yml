@@ -1,28 +1,35 @@
-name: 台股塞選器
+name: 台股篩選器
 on:
   schedule:
-    - cron: '30 11 * * 1-5'  # 台灣時間 19:30
+    - cron: '30 11 * * 1-5' # 台灣時間 19:30
   workflow_dispatch:        # 允許手動測試
 
 jobs:
   filter:
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # 確保有寫入權限以覆蓋 result.csv
+      contents: write
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+
       - name: Install dependencies
-        run: pip install requests pandas lxml
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Run Filter
         run: python stock_filter.py
+
       - name: Commit and Push
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add result.csv
-          git commit -m "Daily update result.csv" || exit 0
+          git commit -m "自動更新今日篩選結果" || exit 0
           git push
+
