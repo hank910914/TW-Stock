@@ -2,3 +2,5 @@ gspread
 oauth2client
 yfinance
 pandas
+requests
+lxml
