@@ -1,4 +1,5 @@
 name: 台股篩選器
+
 on:
   schedule:
     - cron: '30 11 * * 1-5' # 台灣時間 19:30
@@ -10,7 +11,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -20,16 +22,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # 強制從專案根目錄讀取 requirements.txt
           pip install -r requirements.txt
 
       - name: Run Filter
         run: python stock_filter.py
-
+        
       - name: Commit and Push
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add result.csv
-          git commit -m "自動更新今日篩選結果" || exit 0
-          git push
-
+          # 如果沒有產出 result.csv，這行會確保不會報錯
+          if [ -f result.csv ]; then
+            git add result.csv
+            git commit -m "自動更新今日篩選結果" || exit 0
+            git push
+          else
+            echo "result.csv 不存在，跳過提交"
+          fi
